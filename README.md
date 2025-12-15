@@ -8,7 +8,7 @@ Requirement:
 
 Note for future me :3
 
-Using ws2_32 compiler low level langguage focused on network communication
+Using ws2_32 compiler low level langguage focused on network communication\n
 and socket management.
 
 gcc tcp_chat_client.c -o Chat_ClientLan.exe -lws2_32 (Compile client side)
