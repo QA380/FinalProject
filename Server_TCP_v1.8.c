@@ -26,7 +26,7 @@ typedef struct {
 } Server;
 
 Server server = {0};
-
+exit(0)
 void set_color(int color) {
     SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color);
 }
