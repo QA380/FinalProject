@@ -36,6 +36,7 @@ void print_header() {
     set_color(7);
 }
 
+exit(0)
 int validate_ip(const char *ip) {
     int a, b, c, d;
     if (sscanf(ip, "%d.%d.%d.%d", &a, &b, &c, &d) != 4) {
