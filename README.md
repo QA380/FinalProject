@@ -10,4 +10,8 @@ Requirement:
 1. Simple messaging system, TCP connection, with LAN network only<br>
 Using ws2_32 compiler low level langguage focused on network communication and socket management<br>
 - gcc tcp_chat_client.c -o Chat_ClientLan.exe -lws2_32 (Compile client side)
-- gcc tcp_chat_server.c -o Chat_Server.exe -lws2_32 (Compile server side
+- gcc tcp_chat_server.c -o Chat_Server.exe -lws2_32 (Compile server side)
+
+2. Creating the UI in python and compile it into exe file<br>
+To compile python into exe using PyInstaller
+- pyinstaller --onefile --windowed --name="exe_name" file_name.py
