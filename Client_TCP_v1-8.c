@@ -1,12 +1,20 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <winsock2.h>
-#include <windows.h>
-#include <conio.h>
+#include <stdio.h>    // For standard I/O functions
+#include <stdlib.h>   // For standard functions
+#include <string.h>   // For string functions
+#include <winsock2.h> // For Winsock functions
+#include <windows.h>  // For SetConsoleTextAttribute
+#include <conio.h>    // For _getch()
 
+// Link with Ws2_32.lib and Iphlpapi.lib (compiler directive for MSVC)
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "IPHLPAPI.lib")
 
+// Constants for connection
+#define IP_ADDRESS_SIZE 16
+#define WORKING_BUFFER_SIZE 15000 // Initial buffer size (15KB | 1,000B = 1KB)
+#define MAX_TRIES 100 // Max tries to allocate buffer
+
+// Client state structure
 #define BUFFER_SIZE 2048
 #define MAX_USERNAME 32
 #define MAX_MSG 512
@@ -31,12 +39,11 @@ void clear_screen() {
 void print_header() {
     set_color(11); // Cyan
     printf("=================================================\n");
-    printf("|         TCP CHANNEL CHAT SYSTEM v1.0          |\n");
+    printf("|         TCP CHANNEL CHAT SYSTEM v1.9          |\n");
     printf("=================================================\n");
     set_color(7);
 }
 
-exit(0)
 int validate_ip(const char *ip) {
     int a, b, c, d;
     if (sscanf(ip, "%d.%d.%d.%d", &a, &b, &c, &d) != 4) {
@@ -69,13 +76,15 @@ void print_main_screen(ClientState *state, const char *server_ip, int server_por
     
     set_color(7);
     printf("Commands:\n");
+    printf("  /help             - Display all commands\n");
     printf("  /join [0000-9999] - Join a channel\n");
     printf("  /name [username]  - Set username\n");
-    printf("  /reconnect        - Change server connection\n");
+    printf("  /rc               - Change server connection\n");
     printf("  /quit             - Exit program\n");
     printf("\n> ");
 }
 
+// Print chat header with channel and user count
 void print_chat_header(ClientState *state) {
     set_color(11);
     printf("Channel: [%04d]", state->current_channel);
@@ -84,14 +93,14 @@ void print_chat_header(ClientState *state) {
            state->connected_users, 
            state->connected_users != 1 ? "s" : "");
     set_color(11);
-    printf("═══════════════════════════════════════════════════\n");
+    printf("===============================================\n");
     set_color(7);
 }
-
+// Send message to server
 int send_message(SOCKET sock, const char *msg) {
     int len = strlen(msg);
     int sent = send(sock, msg, len, 0);
-    
+
     if (sent == SOCKET_ERROR) {
         set_color(12);
         printf("\n[ERROR] Failed to send message: %d\n", WSAGetLastError());
@@ -101,15 +110,16 @@ int send_message(SOCKET sock, const char *msg) {
     return 1;
 }
 
+// Thread to receive messages from server
 DWORD WINAPI receive_thread(LPVOID param) {
     ClientState *state = (ClientState*)param;
     char buffer[BUFFER_SIZE];
     int bytes;
-    
+
     while (state->running) {
         memset(buffer, 0, BUFFER_SIZE);
         bytes = recv(state->sock, buffer, BUFFER_SIZE - 1, 0);
-        
+
         if (bytes <= 0) {
             if (state->running) {
                 set_color(12);
@@ -119,7 +129,7 @@ DWORD WINAPI receive_thread(LPVOID param) {
             }
             break;
         }
-        
+
         buffer[bytes] = '\0';
         
         // Parse server messages
@@ -162,6 +172,7 @@ DWORD WINAPI receive_thread(LPVOID param) {
     return 0;
 }
 
+// Connect to server function
 int connect_to_server(ClientState *state, const char *host, int port) {
     WSADATA wsa;
     struct sockaddr_in server;
@@ -172,7 +183,7 @@ int connect_to_server(ClientState *state, const char *host, int port) {
         set_color(7);
         return 0;
     }
-    
+
     state->sock = socket(AF_INET, SOCK_STREAM, 0);
     if (state->sock == INVALID_SOCKET) {
         set_color(12);
@@ -201,7 +212,6 @@ int connect_to_server(ClientState *state, const char *host, int port) {
         printf("  - Server is running at %s:%d\n", host, port);
         printf("  - IP address is correct\n");
         printf("  - Firewall allows connection\n");
-        printf("  - You're on the same Hamachi network\n");
         set_color(7);
         closesocket(state->sock);
         WSACleanup();
@@ -291,7 +301,7 @@ void handle_command(ClientState *state, const char *input, int *reconnect_flag) 
         printf("  /join [0000-9999] - Join a channel\n");
         printf("  /name [username]  - Set your username\n");
         printf("  /list             - List users in current channel\n");
-        printf("  /rc        - Change server connection\n");
+        printf("  /rc               - Change server connection\n");
         printf("  /quit             - Leave channel or exit\n");
         printf("  /help             - Show this help\n\n");
         set_color(7);
@@ -351,30 +361,37 @@ void chat_loop(ClientState *state, const char *server_ip, int server_port, int *
     CloseHandle(recv_handle);
 }
 
+// Get server connection info from user (connect_to_server page)
+
 int get_server_info(char *host, int *port) {
     set_color(14);
     printf("\n=================================================\n");
     printf(  "|            SERVER CONNECTION SETUP            |\n");
     printf(  "=================================================\n");
     set_color(7);
-    
+
     printf("Enter server IPv4 address\n");
     set_color(10);
     printf("Examples:\n");
-    printf("  Localhost:      127.0.0.1\n");
-    printf("  Local network:  192.168.1.100\n");
+    printf("  Localhost       : 127.0.0.1\n");
+    printf("  Local network   : 192.168.1.100\n");
+    printf("  Your IP         :\n");
     set_color(7);
-    
+
     while (1) {
         set_color(14);
         printf("Server IP: ");
         set_color(7);
         
+        // Get user input
         if (fgets(host, MAX_IP, stdin) == NULL) {
             set_color(12);
             printf("[ERROR] Failed to read input\n");
             set_color(7);
-            continue;
+            Sleep(1500);
+            system("cls");
+            return get_server_info(host, port);
+
         }
         
         // Remove newline
@@ -385,14 +402,18 @@ int get_server_info(char *host, int *port) {
             set_color(12);
             printf("[ERROR] IP address cannot be empty\n");
             set_color(7);
-            continue;
+            Sleep(1500);
+            system("cls");
+            return get_server_info(host, port);
         }
         
         if (!validate_ip(host)) {
             set_color(12);
             printf("[ERROR] Invalid IP format. Use: xxx.xxx.xxx.xxx\n");
             set_color(7);
-            continue;
+            Sleep(1500);
+            system("cls");
+            return get_server_info(host, port);
         }
         
         break;
@@ -402,10 +423,10 @@ int get_server_info(char *host, int *port) {
     set_color(14);
     printf("\nServer Port [default: 8888]: ");
     set_color(7);
-    
+
     char port_input[10];
     *port = 8888; // Default
-    
+
     if (fgets(port_input, 10, stdin) != NULL) {
         port_input[strcspn(port_input, "\n")] = 0;
         if (strlen(port_input) > 0) {
@@ -419,7 +440,6 @@ int get_server_info(char *host, int *port) {
             }
         }
     }
-    
     printf("\n");
     return 1;
 }
@@ -433,7 +453,7 @@ int main(int argc, char *argv[]) {
     int port = 8888;
     int reconnect_flag = 0;
     int exit_program = 0;
-    
+
     while (!exit_program) {
         clear_screen();
         print_header();
@@ -485,9 +505,7 @@ int main(int argc, char *argv[]) {
             // Keep username
         }
     }
-    
     WSACleanup();
-    
     set_color(14);
     printf("\nGoodbye!\n");
     set_color(7);
