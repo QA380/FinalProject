@@ -1,10 +1,10 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <winsock2.h>
-#include <windows.h>
+#include <stdio.h>    // For standard I/O functions
+#include <stdlib.h>   // For standard functions
+#include <string.h>   // For string functions
+#include <winsock2.h> // For Winsock functions
+#include <windows.h>  // For SetConsoleTextAttribute
 
-#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "ws2_32.lib") // Link with Ws2_32.lib (Compiler directive)
 
 #define MAX_CLIENTS 100
 #define BUFFER_SIZE 2048
@@ -26,7 +26,7 @@ typedef struct {
 } Server;
 
 Server server = {0};
-exit(0)
+
 void set_color(int color) {
     SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color);
 }
@@ -60,6 +60,7 @@ int send_to_client(Client *client, const char *msg) {
     return 1;
 }
 
+// Broadcast message to all clients in a channel except the excluded client
 void broadcast_to_channel(int channel_id, const char *msg, Client *exclude) {
     EnterCriticalSection(&server.lock);
     
@@ -73,7 +74,7 @@ void broadcast_to_channel(int channel_id, const char *msg, Client *exclude) {
     
     LeaveCriticalSection(&server.lock);
 }
-
+// Count users in a specific channel
 int count_users_in_channel(int channel_id) {
     int count = 0;
     EnterCriticalSection(&server.lock);
@@ -89,11 +90,12 @@ int count_users_in_channel(int channel_id) {
     return count;
 }
 
+// Send user count to all clients in a channel
 void send_user_count(int channel_id) {
     int count = count_users_in_channel(channel_id);
     char msg[BUFFER_SIZE];
     snprintf(msg, BUFFER_SIZE, "USERCOUNT:%d", count);
-    
+
     EnterCriticalSection(&server.lock);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (server.clients[i].active && 
@@ -104,6 +106,7 @@ void send_user_count(int channel_id) {
     LeaveCriticalSection(&server.lock);
 }
 
+// Handle client commands
 void handle_join(Client *client, const char *data) {
     int new_channel;
     char username[MAX_USERNAME];
@@ -144,6 +147,7 @@ void handle_join(Client *client, const char *data) {
     log_msg("INFO", log);
 }
 
+// Handle client leaving a channel
 void handle_leave(Client *client) {
     if (client->channel_id == -1) return;
     
@@ -166,6 +170,7 @@ void handle_leave(Client *client) {
     log_msg("INFO", log);
 }
 
+// Handle listing users in the current channel
 void handle_list(Client *client) {
     if (client->channel_id == -1) {
         send_to_client(client, "ERROR:Not in a channel");
@@ -191,6 +196,7 @@ void handle_list(Client *client) {
     send_to_client(client, msg);
 }
 
+// Handle sending a message to the current channel
 void handle_message(Client *client, const char *data) {
     if (client->channel_id == -1) {
         send_to_client(client, "ERROR:Not in a channel");
@@ -202,6 +208,7 @@ void handle_message(Client *client, const char *data) {
     broadcast_to_channel(client->channel_id, msg, NULL);
 }
 
+// Client handler thread
 DWORD WINAPI client_handler(LPVOID param) {
     Client *client = (Client*)param;
     char buffer[BUFFER_SIZE];
@@ -259,6 +266,7 @@ DWORD WINAPI client_handler(LPVOID param) {
     return 0;
 }
 
+// Start the TCP chat server
 int start_server(int port) {
     WSADATA wsa;
     SOCKET listen_sock;
@@ -365,7 +373,7 @@ int main(int argc, char *argv[]) {
     }
     
     set_color(11);
-    printf("      TCP CHANNEL CHAT SERVER v1.0\n");
+    printf("      TCP CHANNEL CHAT SERVER v1.9\n");
     set_color(7);
     
     if (!start_server(port)) {
