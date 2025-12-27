@@ -3,512 +3,383 @@
 #include <string.h>   // For string functions
 #include <winsock2.h> // For Winsock functions
 #include <windows.h>  // For SetConsoleTextAttribute
-#include <conio.h>    // For _getch()
 
-// Link with Ws2_32.lib and Iphlpapi.lib (compiler directive for MSVC)
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "IPHLPAPI.lib")
+#pragma comment(lib, "ws2_32.lib") // Link with Ws2_32.lib (Compiler directive)
 
-// Constants for connection
-#define IP_ADDRESS_SIZE 16
-#define WORKING_BUFFER_SIZE 15000 // Initial buffer size (15KB | 1,000B = 1KB)
-#define MAX_TRIES 100 // Max tries to allocate buffer
-
-// Client state structure
+#define MAX_CLIENTS 100
 #define BUFFER_SIZE 2048
 #define MAX_USERNAME 32
-#define MAX_MSG 512
-#define MAX_IP 16
+#define MAX_CHANNELS 10000
 
 typedef struct {
-    SOCKET sock;
+    SOCKET socket;
     char username[MAX_USERNAME];
-    int current_channel;
-    int connected_users;
+    int channel_id;
+    int active;
+    HANDLE thread;
+} Client;
+
+typedef struct {
+    Client clients[MAX_CLIENTS];
+    CRITICAL_SECTION lock;
     int running;
-} ClientState;
+} Server;
+
+Server server = {0};
 
 void set_color(int color) {
     SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color);
 }
-
-void clear_screen() {
-    system("cls");
-}
-
-void print_header() {
-    set_color(11); // Cyan
-    printf("=================================================\n");
-    printf("|         TCP CHANNEL CHAT SYSTEM v1.9          |\n");
-    printf("=================================================\n");
+// Log messages with timestamp and type
+void log_msg(const char *type, const char *msg) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    
+    if (strcmp(type, "INFO") == 0) set_color(10);
+    else if (strcmp(type, "WARN") == 0) set_color(14);
+    else if (strcmp(type, "ERROR") == 0) set_color(12);
+    else set_color(7);
+    
+    printf("[%02d:%02d:%02d] [%s] %s\n", st.wHour, st.wMinute, st.wSecond, type, msg);
     set_color(7);
 }
 
-int validate_ip(const char *ip) {
-    int a, b, c, d;
-    if (sscanf(ip, "%d.%d.%d.%d", &a, &b, &c, &d) != 4) {
-        return 0;
-    }
-    if (a < 0 || a > 255 || b < 0 || b > 255 || 
-        c < 0 || c > 255 || d < 0 || d > 255) {
-        return 0;
-    }
-    return 1;
-}
-
-void print_main_screen(ClientState *state, const char *server_ip, int server_port) {
-    clear_screen();
-    print_header();
-    set_color(14); // Yellow
-    printf("\nUsername: ");
-    set_color(10); // Green
-    printf("%s\n", state->username[0] ? state->username : "[Not Set]");
+int send_to_client(Client *client, const char *msg) {
+    if (!client->active) return 0;
     
-    set_color(14);
-    printf("Channel ID: ");
-    set_color(10);
-    printf("%04d\n", state->current_channel);
-    
-    set_color(14);
-    printf("Connected to: ");
-    set_color(10);
-    printf("%s:%d\n\n", server_ip, server_port);
-    
-    set_color(7);
-    printf("Commands:\n");
-    printf("  /help             - Display all commands\n");
-    printf("  /join [0000-9999] - Join a channel\n");
-    printf("  /name [username]  - Set username\n");
-    printf("  /rc               - Change server connection\n");
-    printf("  /quit             - Exit program\n");
-    printf("\n> ");
-}
-
-// Print chat header with channel and user count
-void print_chat_header(ClientState *state) {
-    set_color(11);
-    printf("Channel: [%04d]", state->current_channel);
-    set_color(14);
-    printf(" | Connected: %d user%s\n", 
-           state->connected_users, 
-           state->connected_users != 1 ? "s" : "");
-    set_color(11);
-    printf("===============================================\n");
-    set_color(7);
-}
-// Send message to server
-int send_message(SOCKET sock, const char *msg) {
     int len = strlen(msg);
-    int sent = send(sock, msg, len, 0);
-
+    int sent = send(client->socket, msg, len, 0);
+    
     if (sent == SOCKET_ERROR) {
-        set_color(12);
-        printf("\n[ERROR] Failed to send message: %d\n", WSAGetLastError());
-        set_color(7);
+        char err[256];
+        snprintf(err, 256, "Failed to send to %s: %d", 
+                 client->username, WSAGetLastError());
+        log_msg("ERROR", err);
         return 0;
     }
     return 1;
 }
 
-// Thread to receive messages from server
-DWORD WINAPI receive_thread(LPVOID param) {
-    ClientState *state = (ClientState*)param;
+// Broadcast message to all clients in a channel except the excluded client
+void broadcast_to_channel(int channel_id, const char *msg, Client *exclude) {
+    EnterCriticalSection(&server.lock);
+    
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (server.clients[i].active && 
+            server.clients[i].channel_id == channel_id &&
+            &server.clients[i] != exclude) {
+            send_to_client(&server.clients[i], msg);
+        }
+    }
+    
+    LeaveCriticalSection(&server.lock);
+}
+// Count users in a specific channel
+int count_users_in_channel(int channel_id) {
+    int count = 0;
+    EnterCriticalSection(&server.lock);
+    
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (server.clients[i].active && 
+            server.clients[i].channel_id == channel_id) {
+            count++;
+        }
+    }
+    
+    LeaveCriticalSection(&server.lock);
+    return count;
+}
+
+// Send user count to all clients in a channel
+void send_user_count(int channel_id) {
+    int count = count_users_in_channel(channel_id);
+    char msg[BUFFER_SIZE];
+    snprintf(msg, BUFFER_SIZE, "USERCOUNT:%d", count);
+
+    EnterCriticalSection(&server.lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (server.clients[i].active && 
+            server.clients[i].channel_id == channel_id) {
+            send_to_client(&server.clients[i], msg);
+        }
+    }
+    LeaveCriticalSection(&server.lock);
+}
+
+// Handle client commands
+void handle_join(Client *client, const char *data) {
+    int new_channel;
+    char username[MAX_USERNAME];
+    
+    if (sscanf(data, "%d:%31s", &new_channel, username) != 2) {
+        send_to_client(client, "ERROR:Invalid join format");
+        return;
+    }
+    
+    if (new_channel < 0 || new_channel >= MAX_CHANNELS) {
+        send_to_client(client, "ERROR:Invalid channel ID");
+        return;
+    }
+    
+    int old_channel = client->channel_id;
+    
+    EnterCriticalSection(&server.lock);
+    strncpy(client->username, username, MAX_USERNAME - 1);
+    client->username[MAX_USERNAME - 1] = '\0';
+    client->channel_id = new_channel;
+    LeaveCriticalSection(&server.lock);
+    
+    char msg[BUFFER_SIZE];
+    snprintf(msg, BUFFER_SIZE, "JOINED:%04d", new_channel);
+    send_to_client(client, msg);
+    
+    if (old_channel != -1 && old_channel != new_channel) {
+        send_user_count(old_channel);
+    }
+    
+    send_user_count(new_channel);
+    
+    snprintf(msg, BUFFER_SIZE, "Server:*** %s joined the channel ***", username);
+    broadcast_to_channel(new_channel, msg, client);
+    
+    char log[256];
+    snprintf(log, 256, "%s joined channel %04d", username, new_channel);
+    log_msg("INFO", log);
+}
+
+// Handle client leaving a channel
+void handle_leave(Client *client) {
+    if (client->channel_id == -1) return;
+    
+    int old_channel = client->channel_id;
+    char old_username[MAX_USERNAME];
+    strncpy(old_username, client->username, MAX_USERNAME);
+    
+    EnterCriticalSection(&server.lock);
+    client->channel_id = -1;
+    LeaveCriticalSection(&server.lock);
+    
+    char msg[BUFFER_SIZE];
+    snprintf(msg, BUFFER_SIZE, "Server:*** %s left the channel ***", old_username);
+    broadcast_to_channel(old_channel, msg, NULL);
+    
+    send_user_count(old_channel);
+    
+    char log[256];
+    snprintf(log, 256, "%s left channel %04d", old_username, old_channel);
+    log_msg("INFO", log);
+}
+
+// Handle listing users in the current channel
+void handle_list(Client *client) {
+    if (client->channel_id == -1) {
+        send_to_client(client, "ERROR:Not in a channel");
+        return;
+    }
+    
+    char userlist[BUFFER_SIZE] = "";
+    int first = 1;
+    
+    EnterCriticalSection(&server.lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (server.clients[i].active && 
+            server.clients[i].channel_id == client->channel_id) {
+            if (!first) strcat(userlist, ", ");
+            strcat(userlist, server.clients[i].username);
+            first = 0;
+        }
+    }
+    LeaveCriticalSection(&server.lock);
+    
+    char msg[BUFFER_SIZE];
+    snprintf(msg, BUFFER_SIZE, "USERLIST:%s", userlist);
+    send_to_client(client, msg);
+}
+
+// Handle sending a message to the current channel
+void handle_message(Client *client, const char *data) {
+    if (client->channel_id == -1) {
+        send_to_client(client, "ERROR:Not in a channel");
+        return;
+    }
+    
+    char msg[BUFFER_SIZE];
+    snprintf(msg, BUFFER_SIZE, "%s:%s", client->username, data);
+    broadcast_to_channel(client->channel_id, msg, NULL);
+}
+
+// Client handler thread
+DWORD WINAPI client_handler(LPVOID param) {
+    Client *client = (Client*)param;
     char buffer[BUFFER_SIZE];
     int bytes;
-
-    while (state->running) {
+    
+    char log[256];
+    snprintf(log, 256, "New client connected from socket %d", (int)client->socket);
+    log_msg("INFO", log);
+    
+    while (server.running && client->active) {
         memset(buffer, 0, BUFFER_SIZE);
-        bytes = recv(state->sock, buffer, BUFFER_SIZE - 1, 0);
-
+        bytes = recv(client->socket, buffer, BUFFER_SIZE - 1, 0);
+        
         if (bytes <= 0) {
-            if (state->running) {
-                set_color(12);
-                printf("\n[ERROR] Connection lost to server\n");
-                set_color(7);
-                state->running = 0;
+            if (bytes == 0) {
+                log_msg("INFO", "Client disconnected gracefully");
+            } else {
+                snprintf(log, 256, "Client recv error: %d", WSAGetLastError());
+                log_msg("ERROR", log);
             }
             break;
         }
-
+        
         buffer[bytes] = '\0';
         
-        // Parse server messages
-        if (strncmp(buffer, "USERCOUNT:", 10) == 0) {
-            state->connected_users = atoi(buffer + 10);
-            continue;
+        if (strncmp(buffer, "JOIN:", 5) == 0) {
+            handle_join(client, buffer + 5);
         }
-        else if (strncmp(buffer, "JOINED:", 7) == 0) {
-            state->current_channel = atoi(buffer + 7);
-            clear_screen();
-            print_chat_header(state);
-            continue;
+        else if (strcmp(buffer, "LEAVE") == 0) {
+            handle_leave(client);
         }
-        else if (strncmp(buffer, "ERROR:", 6) == 0) {
-            set_color(12);
-            printf("\n[SERVER ERROR] %s\n", buffer + 6);
-            set_color(7);
-            continue;
+        else if (strcmp(buffer, "LIST") == 0) {
+            handle_list(client);
         }
-        else if (strncmp(buffer, "USERLIST:", 9) == 0) {
-            set_color(13);
-            printf("\n[Users in channel]: %s\n", buffer + 9);
-            set_color(7);
-            continue;
+        else if (strncmp(buffer, "MSG:", 4) == 0) {
+            handle_message(client, buffer + 4);
         }
-        
-        // Regular message - parse username and message
-        char *delim = strchr(buffer, ':');
-        if (delim) {
-            *delim = '\0';
-            set_color(10);
-            printf("<%s>", buffer);
-            set_color(7);
-            printf(" %s\n", delim + 1);
-        } else {
-            printf("%s\n", buffer);
+        else {
+            send_to_client(client, "ERROR:Unknown command");
         }
     }
+    
+    handle_leave(client);
+    
+    EnterCriticalSection(&server.lock);
+    client->active = 0;
+    closesocket(client->socket);
+    client->socket = INVALID_SOCKET;
+    LeaveCriticalSection(&server.lock);
+    
+    snprintf(log, 256, "Client %s disconnected", 
+             client->username[0] ? client->username : "unknown");
+    log_msg("INFO", log);
     
     return 0;
 }
 
-// Connect to server function
-int connect_to_server(ClientState *state, const char *host, int port) {
+// Start the TCP chat server
+int start_server(int port) {
     WSADATA wsa;
-    struct sockaddr_in server;
+    SOCKET listen_sock;
+    struct sockaddr_in server_addr;
     
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        set_color(12);
-        printf("[ERROR] WSAStartup failed: %d\n", WSAGetLastError());
-        set_color(7);
+        log_msg("ERROR", "WSAStartup failed");
         return 0;
     }
-
-    state->sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (state->sock == INVALID_SOCKET) {
-        set_color(12);
-        printf("[ERROR] Socket creation failed: %d\n", WSAGetLastError());
-        set_color(7);
+    
+    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_sock == INVALID_SOCKET) {
+        log_msg("ERROR", "Socket creation failed");
         WSACleanup();
         return 0;
     }
     
-    server.sin_family = AF_INET;
-    server.sin_addr.s_addr = inet_addr(host);
-    server.sin_port = htons(port);
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(port);
     
-    set_color(14);
-    printf("\nConnecting to %s:%d", host, port);
-    set_color(7);
-    
-    // Set socket timeout for connection
-    int timeout = 5000; // 5 seconds
-    setsockopt(state->sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-    
-    if (connect(state->sock, (struct sockaddr*)&server, sizeof(server)) < 0) {
-        set_color(12);
-        printf("\n[ERROR] Connection failed: %d\n", WSAGetLastError());
-        printf("Make sure:\n");
-        printf("  - Server is running at %s:%d\n", host, port);
-        printf("  - IP address is correct\n");
-        printf("  - Firewall allows connection\n");
-        set_color(7);
-        closesocket(state->sock);
+    if (bind(listen_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+        log_msg("ERROR", "Bind failed");
+        closesocket(listen_sock);
         WSACleanup();
         return 0;
     }
     
-    // Reset timeout to blocking mode
-    timeout = 0;
-    setsockopt(state->sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR) {
+        log_msg("ERROR", "Listen failed");
+        closesocket(listen_sock);
+        WSACleanup();
+        return 0;
+    }
     
-    set_color(10);
-    printf("\n[SUCCESS] Connected to server %s:%d\n", host, port);
-    set_color(7);
-    return 1;
-}
-
-// Handle user commands
-void handle_command(ClientState *state, const char *input, int *reconnect_flag) {
-    char cmd[MAX_MSG];
-    strncpy(cmd, input, MAX_MSG - 1);
-    cmd[MAX_MSG - 1] = '\0';
+    char msg[256];
+    snprintf(msg, 256, "Server listening on port %d", port);
+    log_msg("INFO", msg);
     
-    if (strncmp(cmd, "/join ", 6) == 0) {
-        int channel = atoi(cmd + 6);
-        if (channel < 0 || channel > 9999) {
-            set_color(12);
-            printf("[ERROR] Channel ID must be between 0000-9999\n");
-            set_color(7);
-            return;
-        }
+    server.running = 1;
+    InitializeCriticalSection(&server.lock);
+    
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        server.clients[i].active = 0;
+        server.clients[i].channel_id = -1;
+        server.clients[i].socket = INVALID_SOCKET;
+    }
+    
+    while (server.running) {
+        struct sockaddr_in client_addr;
+        int addr_len = sizeof(client_addr);
         
-        if (strlen(state->username) == 0) {
-            set_color(12);
-            printf("[ERROR] Please set username first with /name\n");
-            set_color(7);
-            return;
-        }
+        SOCKET client_sock = accept(listen_sock, (struct sockaddr*)&client_addr, &addr_len);
         
-        char msg[BUFFER_SIZE];
-        snprintf(msg, BUFFER_SIZE, "JOIN:%04d:%s", channel, state->username);
-        send_message(state->sock, msg);
-    }
-    else if (strncmp(cmd, "/name ", 6) == 0) {
-        const char *name = cmd + 6;
-        if (strlen(name) == 0 || strlen(name) >= MAX_USERNAME) {
-            set_color(12);
-            printf("[ERROR] Username must be 1-%d characters\n", MAX_USERNAME - 1);
-            set_color(7);
-            return;
-        }
-        
-        strncpy(state->username, name, MAX_USERNAME - 1);
-        state->username[MAX_USERNAME - 1] = '\0';
-        
-        set_color(10);
-        printf("[SUCCESS] Username set to: %s\n", state->username);
-        set_color(7);
-    }
-    else if (strcmp(cmd, "/list") == 0) {
-        if (state->current_channel == -1) {
-            set_color(12);
-            printf("[ERROR] You must join a channel first\n");
-            set_color(7);
-            return;
-        }
-        send_message(state->sock, "LIST");
-    }
-    else if (strcmp(cmd, "/rc") == 0) {
-        set_color(14);
-        printf("\n[INFO] Disconnecting from current server...\n");
-        set_color(7);
-        *reconnect_flag = 1;
-        state->running = 0;
-    }
-    else if (strcmp(cmd, "/quit") == 0) {
-        if (state->current_channel != -1) {
-            send_message(state->sock, "LEAVE");
-            state->current_channel = -1;
-            print_main_screen(state, "", 0);
-        } else {
-            state->running = 0;
-        }
-    }
-    else if (strcmp(cmd, "/help") == 0) {
-        set_color(14);
-        printf("\nAvailable commands:\n");
-        printf("  /join [0000-9999] - Join a channel\n");
-        printf("  /name [username]  - Set your username\n");
-        printf("  /list             - List users in current channel\n");
-        printf("  /rc               - Change server connection\n");
-        printf("  /quit             - Leave channel or exit\n");
-        printf("  /help             - Show this help\n\n");
-        set_color(7);
-    }
-    else {
-        set_color(12);
-        printf("[ERROR] Unknown command. Type /help for commands\n");
-        set_color(7);
-    }
-}
-
-void chat_loop(ClientState *state, const char *server_ip, int server_port, int *reconnect_flag) {
-    char input[MAX_MSG];
-    HANDLE recv_handle;
-    DWORD thread_id;
-    
-    state->running = 1;
-    recv_handle = CreateThread(NULL, 0, receive_thread, state, 0, &thread_id);
-    
-    if (recv_handle == NULL) {
-        set_color(12);
-        printf("[ERROR] Failed to create receive thread\n");
-        set_color(7);
-        return;
-    }
-    
-    print_main_screen(state, server_ip, server_port);
-    
-    while (state->running) {
-        if (fgets(input, MAX_MSG, stdin) == NULL) {
+        if (client_sock == INVALID_SOCKET) {
+            if (server.running) {
+                log_msg("ERROR", "Accept failed");
+            }
             continue;
         }
         
-        // Remove newline
-        input[strcspn(input, "\n")] = 0;
+        int slot = -1;
+        EnterCriticalSection(&server.lock);
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (!server.clients[i].active) {
+                slot = i;
+                server.clients[i].socket = client_sock;
+                server.clients[i].active = 1;
+                server.clients[i].channel_id = -1;
+                server.clients[i].username[0] = '\0';
+                break;
+            }
+        }
+        LeaveCriticalSection(&server.lock);
         
-        if (strlen(input) == 0) {
+        if (slot == -1) {
+            log_msg("WARN", "Max clients reached, rejecting connection");
+            closesocket(client_sock);
             continue;
         }
         
-        if (input[0] == '/') {
-            handle_command(state, input, reconnect_flag);
-        } else {
-            if (state->current_channel == -1) {
-                set_color(12);
-                printf("[ERROR] Join a channel first with /join [id]\n");
-                set_color(7);
-            } else {
-                char msg[BUFFER_SIZE];
-                snprintf(msg, BUFFER_SIZE, "MSG:%s", input);
-                send_message(state->sock, msg);
-            }
+        DWORD thread_id;
+        server.clients[slot].thread = CreateThread(NULL, 0, client_handler, 
+                                                    &server.clients[slot], 0, &thread_id);
+        
+        if (server.clients[slot].thread == NULL) {
+            log_msg("ERROR", "Failed to create client thread");
+            server.clients[slot].active = 0;
+            closesocket(client_sock);
         }
     }
     
-    WaitForSingleObject(recv_handle, 3000);
-    CloseHandle(recv_handle);
-}
-
-// Get server connection info from user (connect_to_server page)
-
-int get_server_info(char *host, int *port) {
-    set_color(14);
-    printf("\n=================================================\n");
-    printf(  "|            SERVER CONNECTION SETUP            |\n");
-    printf(  "=================================================\n");
-    set_color(7);
-
-    printf("Enter server IPv4 address\n");
-    set_color(10);
-    printf("Examples:\n");
-    printf("  Localhost       : 127.0.0.1\n");
-    printf("  Local network   : 192.168.1.100\n");
-    printf("  Your IP         :\n");
-    set_color(7);
-
-    while (1) {
-        set_color(14);
-        printf("Server IP: ");
-        set_color(7);
-        
-        // Get user input
-        if (fgets(host, MAX_IP, stdin) == NULL) {
-            set_color(12);
-            printf("[ERROR] Failed to read input\n");
-            set_color(7);
-            Sleep(1500);
-            system("cls");
-            return get_server_info(host, port);
-
-        }
-        
-        // Remove newline
-        host[strcspn(host, "\n")] = 0;
-        
-        // Validate IP
-        if (strlen(host) == 0) {
-            set_color(12);
-            printf("[ERROR] IP address cannot be empty\n");
-            set_color(7);
-            Sleep(1500);
-            system("cls");
-            return get_server_info(host, port);
-        }
-        
-        if (!validate_ip(host)) {
-            set_color(12);
-            printf("[ERROR] Invalid IP format. Use: xxx.xxx.xxx.xxx\n");
-            set_color(7);
-            Sleep(1500);
-            system("cls");
-            return get_server_info(host, port);
-        }
-        
-        break;
-    }
-    
-    // Optional: Get port
-    set_color(14);
-    printf("\nServer Port [default: 8888]: ");
-    set_color(7);
-
-    char port_input[10];
-    *port = 8888; // Default
-
-    if (fgets(port_input, 10, stdin) != NULL) {
-        port_input[strcspn(port_input, "\n")] = 0;
-        if (strlen(port_input) > 0) {
-            int user_port = atoi(port_input);
-            if (user_port > 0 && user_port <= 65535) {
-                *port = user_port;
-            } else {
-                set_color(14);
-                printf("[WARNING] Invalid port, using default: 8888\n");
-                set_color(7);
-            }
-        }
-    }
-    printf("\n");
+    closesocket(listen_sock);
+    DeleteCriticalSection(&server.lock);
+    WSACleanup();
     return 1;
 }
 
 int main(int argc, char *argv[]) {
-    ClientState state = {0};
-    state.current_channel = -1;
-    state.connected_users = 0;
-    
-    char host[MAX_IP];
     int port = 8888;
-    int reconnect_flag = 0;
-    int exit_program = 0;
-
-    while (!exit_program) {
-        clear_screen();
-        print_header();
-        
-        // Get server connection info
-        get_server_info(host, &port);
-        
-        // Connect to server
-        if (!connect_to_server(&state, host, port)) {
-            set_color(14);
-            printf("\nPress 'r' to retry or any other key to exit...");
-            set_color(7);
-            
-            char choice = _getch();
-            if (choice == 'r' || choice == 'R') {
-                continue;
-            } else {
-                exit_program = 1;
-                break;
-            }
-        }
-        
-        Sleep(1000);
-        
-        // Reset reconnect flag
-        reconnect_flag = 0;
-        
-        // Start chat loop
-        chat_loop(&state, host, port, &reconnect_flag);
-        
-        // Clean up connection
-        if (state.current_channel != -1) {
-            send_message(state.sock, "LEAVE");
-        }
-        closesocket(state.sock);
-        
-        // Check if user wants to reconnect
-        if (!reconnect_flag) {
-            exit_program = 1;
-        } else {
-            set_color(10);
-            printf("\n[INFO] Preparing to reconnect...\n");
-            set_color(7);
-            Sleep(1000);
-            
-            // Reset state for new connection
-            state.current_channel = -1;
-            state.connected_users = 0;
-            // Keep username
-        }
+    
+    if (argc >= 2) {
+        port = atoi(argv[1]);
     }
-    WSACleanup();
-    set_color(14);
-    printf("\nGoodbye!\n");
+    
+    set_color(11);
+    printf("      TCP CHANNEL CHAT SERVER v1.9\n");
     set_color(7);
+    
+    if (!start_server(port)) {
+        log_msg("ERROR", "Failed to start server");
+        return 1;
+    }
     
     return 0;
 }
