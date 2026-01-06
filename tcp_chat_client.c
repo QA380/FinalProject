@@ -7,10 +7,11 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-#define BUFFER_SIZE 2048
+#define BUFFER_SIZE 4096
 #define MAX_USERNAME 32
 #define MAX_MSG 512
 #define MAX_IP 16
+#define MAX_PASSWORD 64
 
 typedef struct {
     SOCKET sock;
@@ -21,6 +22,8 @@ typedef struct {
     int echo_local_messages;
     int client_id;
     int loading_animation;
+    int authenticated;          // New: server authentication status
+    int server_requires_auth;   // New: does server require auth?
 } ClientState;
 
 typedef struct {
@@ -121,12 +124,26 @@ void draw_header(ClientState *state) {
     printf("%d", state->connected_users);
 
     set_color(14);
-    printf(" | Username: ");
+    printf(" | User: ");
     set_color(10);
     if (strlen(state->username) == 0) {
         printf("[not set]");
     } else {
         printf("%s", state->username);
+    }
+    
+    // Show authentication status
+    set_color(14);
+    printf(" | Auth: ");
+    if (state->authenticated) {
+        set_color(10);
+        printf("OK");
+    } else if (state->server_requires_auth) {
+        set_color(12);
+        printf("REQ");
+    } else {
+        set_color(8);
+        printf("N/A");
     }
     
     CONSOLE_SCREEN_BUFFER_INFO csbi;
@@ -174,9 +191,9 @@ void draw_input_area() {
     
     set_cursor_position(0, console_layout.input_row + 1);
     set_color(8);
-    printf("Commands: /id /list /quit /help /rc /clear");
+    printf("Commands: /id /list /quit /help /rc /clear /auth");
     
-    int cmd_len = 50;
+    int cmd_len = 55;
     for (int i = cmd_len; i < console_layout.width; i++) printf(" ");
     set_color(7);
     
@@ -245,7 +262,7 @@ void print_message_to_area(const char *message, int color) {
 void print_header() {
     set_color(11);
     printf("===================================================\n");
-    printf("          TCP CHANNEL CHAT SYSTEM v2.5             \n");
+    printf("          TCP CHANNEL CHAT SYSTEM v1.3.21          \n");
     printf("===================================================\n");
     set_color(7);
 }
@@ -294,6 +311,7 @@ DWORD WINAPI receive_thread(LPVOID param) {
         
         buffer[bytes] = '\0';
         
+        // Handle server messages
         if (strncmp(buffer, "USERCOUNT:", 10) == 0) {
             state->connected_users = atoi(buffer + 10);
             update_user_count(state->connected_users);
@@ -317,6 +335,51 @@ DWORD WINAPI receive_thread(LPVOID param) {
             state->client_id = atoi(buffer + 9);
             continue;
         }
+        // New: Authentication responses
+        else if (strncmp(buffer, "AUTH:OK", 7) == 0) {
+            state->authenticated = 1;
+            state->server_requires_auth = 1;
+            print_message_to_area("[AUTH] Successfully authenticated with server", 10);
+            draw_header(state);
+            continue;
+        }
+        else if (strncmp(buffer, "AUTH:FAILED", 11) == 0) {
+            state->authenticated = 0;
+            print_message_to_area("[AUTH] Authentication failed - incorrect password", 12);
+            draw_header(state);
+            continue;
+        }
+        else if (strncmp(buffer, "AUTH:REQUIRED", 13) == 0) {
+            state->server_requires_auth = 1;
+            state->authenticated = 0;
+            print_message_to_area("[AUTH] Server requires authentication. Use /auth <password>", 14);
+            draw_header(state);
+            continue;
+        }
+        else if (strncmp(buffer, "AUTH:BANNED", 11) == 0) {
+            print_message_to_area("[BANNED] You have been banned due to too many failed attempts", 12);
+            state->running = 0;
+            continue;
+        }
+        // New: Channel password required
+        else if (strncmp(buffer, "CHANNEL:PASSWORD_REQUIRED", 25) == 0) {
+            state->loading_animation = 0;
+            print_message_to_area("[CHANNEL] This channel is password protected", 14);
+            print_message_to_area("[CHANNEL] Use: /join <channel> <password>", 14);
+            continue;
+        }
+        else if (strncmp(buffer, "CHANNEL:PASSWORD_INVALID", 24) == 0) {
+            state->loading_animation = 0;
+            print_message_to_area("[CHANNEL] Invalid channel password", 12);
+            continue;
+        }
+        // New: Rate limiting
+        else if (strncmp(buffer, "RATELIMIT:", 10) == 0) {
+            char msg[BUFFER_SIZE];
+            snprintf(msg, BUFFER_SIZE, "[RATE LIMIT] %s", buffer + 10);
+            print_message_to_area(msg, 14);
+            continue;
+        }
         else if (strncmp(buffer, "KICKED:", 7) == 0) {
             char msg[BUFFER_SIZE];
             snprintf(msg, BUFFER_SIZE, "[KICKED] %s", buffer + 7);
@@ -330,6 +393,12 @@ DWORD WINAPI receive_thread(LPVOID param) {
             char msg[BUFFER_SIZE];
             snprintf(msg, BUFFER_SIZE, "[SERVER ERROR] %s", buffer + 6);
             print_message_to_area(msg, 12);
+            
+            // Check for ban message
+            if (strstr(buffer, "banned") != NULL) {
+                Sleep(2000);
+                state->running = 0;
+            }
             continue;
         }
         else if (strncmp(buffer, "USERLIST:", 9) == 0) {
@@ -338,7 +407,22 @@ DWORD WINAPI receive_thread(LPVOID param) {
             print_message_to_area(msg, 13);
             continue;
         }
+        // New: Server info message
+        else if (strncmp(buffer, "INFO:", 5) == 0) {
+            char msg[BUFFER_SIZE];
+            snprintf(msg, BUFFER_SIZE, "[SERVER] %s", buffer + 5);
+            print_message_to_area(msg, 11);
+            continue;
+        }
+        // New: Warning message
+        else if (strncmp(buffer, "WARNING:", 8) == 0) {
+            char msg[BUFFER_SIZE];
+            snprintf(msg, BUFFER_SIZE, "[WARNING] %s", buffer + 8);
+            print_message_to_area(msg, 14);
+            continue;
+        }
         else {
+            // Regular chat message
             char *delim = strchr(buffer, ':');
             if (delim) {
                 *delim = '\0';
@@ -401,6 +485,7 @@ int connect_to_server(ClientState *state, const char *host, int port) {
         printf("  - Server is running at %s:%d\n", host, port);
         printf("  - IP address is correct\n");
         printf("  - Firewall allows connection\n");
+        printf("  - You are not IP banned\n");
         set_color(7);
         closesocket(state->sock);
         WSACleanup();
@@ -410,19 +495,52 @@ int connect_to_server(ClientState *state, const char *host, int port) {
     timeout = 0;
     setsockopt(state->sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     
+    // Reset authentication state
+    state->authenticated = 0;
+    state->server_requires_auth = 0;
+    
     set_color(10);
     printf("\n[SUCCESS] Connected to server %s:%d\n", host, port);
     set_color(7);
     return 1;
 }
 
+// Handle command input
 void handle_command(ClientState *state, const char *input, int *reconnect_flag) {
     char cmd[MAX_MSG];
     strncpy(cmd, input, MAX_MSG - 1);
     cmd[MAX_MSG - 1] = '\0';
     
-    if (strncmp(cmd, "/join ", 6) == 0) {
-        int channel = atoi(cmd + 6);
+    // New: /auth command for server authentication
+    if (strncmp(cmd, "/auth ", 6) == 0) {
+        const char *password = cmd + 6;
+        if (strlen(password) == 0) {
+            print_message_to_area("[ERROR] Usage: /auth <password>", 12);
+            return;
+        }
+        
+        char msg[BUFFER_SIZE];
+        snprintf(msg, BUFFER_SIZE, "AUTH:%s", password);
+        send_message(state->sock, msg);
+        print_message_to_area("[AUTH] Sending authentication...", 14);
+    }
+    // Modified: /join now supports optional channel password
+    else if (strncmp(cmd, "/join ", 6) == 0) {
+        char *args = cmd + 6;
+        int channel = -1;
+        char channel_password[MAX_PASSWORD] = "";
+        
+        // Parse channel and optional password
+        char *space = strchr(args, ' ');
+        if (space) {
+            *space = '\0';
+            channel = atoi(args);
+            strncpy(channel_password, space + 1, MAX_PASSWORD - 1);
+            channel_password[MAX_PASSWORD - 1] = '\0';
+        } else {
+            channel = atoi(args);
+        }
+        
         if (channel < 0 || channel > 9999) {
             print_message_to_area("[ERROR] Channel ID must be between 0000-9999", 12);
             return;
@@ -433,13 +551,24 @@ void handle_command(ClientState *state, const char *input, int *reconnect_flag) 
             return;
         }
         
+        // Check if server requires auth
+        if (state->server_requires_auth && !state->authenticated) {
+            print_message_to_area("[ERROR] You must authenticate first. Use /auth <password>", 12);
+            return;
+        }
+        
         state->loading_animation = 1;
         print_message_to_area("Joining channel...", 14);
         
         char msg[BUFFER_SIZE];
-        snprintf(msg, BUFFER_SIZE, "JOIN:%04d:%s", channel, state->username);
+        if (strlen(channel_password) > 0) {
+            snprintf(msg, BUFFER_SIZE, "JOIN:%04d:%s:%s", channel, state->username, channel_password);
+        } else {
+            snprintf(msg, BUFFER_SIZE, "JOIN:%04d:%s", channel, state->username);
+        }
         send_message(state->sock, msg);
     }
+    // Name command
     else if (strncmp(cmd, "/name ", 6) == 0) {
         const char *name = cmd + 6;
         if (strlen(name) == 0 || strlen(name) >= MAX_USERNAME) {
@@ -456,6 +585,7 @@ void handle_command(ClientState *state, const char *input, int *reconnect_flag) 
         
         draw_header(state);
     }
+    // Check id command
     else if (strcmp(cmd, "/id") == 0) {
         if (state->client_id > 0) {
             char msg[BUFFER_SIZE];
@@ -465,6 +595,7 @@ void handle_command(ClientState *state, const char *input, int *reconnect_flag) 
             print_message_to_area("[INFO] Client ID not assigned yet. Join a channel first.", 14);
         }
     }
+    // Check list command
     else if (strcmp(cmd, "/list") == 0) {
         if (state->current_channel == -1) {
             print_message_to_area("[ERROR] You must join a channel first", 12);
@@ -472,11 +603,13 @@ void handle_command(ClientState *state, const char *input, int *reconnect_flag) 
         }
         send_message(state->sock, "LIST");
     }
+    // Reconnect command
     else if (strcmp(cmd, "/rc") == 0) {
         print_message_to_area("[INFO] Disconnecting from current server...", 14);
         *reconnect_flag = 1;
         state->running = 0;
     }
+    // Clear screen command
     else if (strcmp(cmd, "/clear") == 0) {
         clear_screen();
         init_console_layout();
@@ -484,6 +617,39 @@ void handle_command(ClientState *state, const char *input, int *reconnect_flag) 
         draw_input_area();
         set_cursor_position(2, console_layout.input_row);
     }
+    // Status command
+    else if (strcmp(cmd, "/status") == 0) {
+        char msg[BUFFER_SIZE];
+        print_message_to_area("--- Connection Status ---", 14);
+        
+        snprintf(msg, BUFFER_SIZE, "  Username: %s", 
+                 strlen(state->username) > 0 ? state->username : "[not set]");
+        print_message_to_area(msg, 7);
+        
+        snprintf(msg, BUFFER_SIZE, "  Channel: %s", 
+                 state->current_channel != -1 ? "connected" : "not joined");
+        print_message_to_area(msg, 7);
+        
+        snprintf(msg, BUFFER_SIZE, "  Server Auth: %s", 
+                 state->server_requires_auth ? 
+                     (state->authenticated ? "authenticated" : "required") : "not required");
+        print_message_to_area(msg, 7);
+        
+        snprintf(msg, BUFFER_SIZE, "  Client ID: %d", state->client_id);
+        print_message_to_area(msg, 7);
+    }
+
+    // Refresh screen command
+    else if (strcmp(cmd, "/refresh") == 0) {
+        clear_screen();
+        init_console_layout();
+        draw_header(state);
+        draw_input_area();
+        set_cursor_position(2, console_layout.input_row);
+        print_message_to_area("[INFO] Screen refreshed", 14);
+    }
+
+    // Leave channel command
     else if (strcmp(cmd, "/quit") == 0) {
         if (state->current_channel != -1) {
             print_message_to_area("Leaving channel...", 14);
@@ -501,13 +667,16 @@ void handle_command(ClientState *state, const char *input, int *reconnect_flag) 
         }
     }
     else if (strcmp(cmd, "/help") == 0) {
-        print_message_to_area("Available commands:", 14);
-        print_message_to_area("  /join [0000-9999] - Join a channel", 7);
-        print_message_to_area("  /name [username]  - Set your username", 7);
-        print_message_to_area("  /id               - Show your client ID", 7);
+        print_message_to_area("=== Available Commands ===", 14);
+        print_message_to_area("  /join [0000-9999] [password] (optional)", 7);
+        print_message_to_area("  /name [username]  - Set username", 7);
+        print_message_to_area("  /auth [password]  - Authenticate with server", 7);
+        print_message_to_area("  /id               - Show client ID", 7);
         print_message_to_area("  /list             - List users in current channel", 7);
+        print_message_to_area("  /status           - Show connection status", 7);
         print_message_to_area("  /rc               - Change server connection", 7);
         print_message_to_area("  /clear            - Clear chat area", 7);
+        print_message_to_area("  /refresh          - Refresh screen, fix display error while maintaining values", 7);
         print_message_to_area("  /quit             - Leave channel or exit", 7);
         print_message_to_area("  /help             - Show this help", 7);
     }
@@ -544,7 +713,8 @@ void chat_loop(ClientState *state, const char *server_ip, int server_port, int *
     char msg[BUFFER_SIZE];
     snprintf(msg, BUFFER_SIZE, "Connected to %s:%d", server_ip, server_port);
     print_message_to_area(msg, 14);
-    print_message_to_area("Set username with /name and join a channel with /join", 7);
+    print_message_to_area("Set username with /name, then join with /join", 7);
+    print_message_to_area("If server requires auth, use /auth <password> first", 8);
     
     while (state->running) {
         int pos = 0;
@@ -559,36 +729,43 @@ void chat_loop(ClientState *state, const char *server_ip, int server_port, int *
         LeaveCriticalSection(&console_lock);
         
         while (1) {
-            ch = _getch();
+            if (!state->running) break;
             
-            if (ch == '\r' || ch == '\n') {
-                input[pos] = '\0';
-                break;
-            }
-            else if (ch == '\b') {
-                if (pos > 0) {
-                    pos--;
+            if (_kbhit()) {
+                ch = _getch();
+                
+                if (ch == '\r' || ch == '\n') {
+                    input[pos] = '\0';
+                    break;
+                }
+                else if (ch == '\b') {
+                    if (pos > 0) {
+                        pos--;
+                        EnterCriticalSection(&console_lock);
+                        printf("\b \b");
+                        LeaveCriticalSection(&console_lock);
+                    }
+                }
+                else if (ch == 27) {
+                    pos = 0;
                     EnterCriticalSection(&console_lock);
-                    printf("\b \b");
+                    set_cursor_position(2, console_layout.input_row);
+                    for (int i = 0; i < console_layout.width - 2; i++) printf(" ");
+                    set_cursor_position(2, console_layout.input_row);
                     LeaveCriticalSection(&console_lock);
                 }
-            }
-            else if (ch == 27) {
-                pos = 0;
-                EnterCriticalSection(&console_lock);
-                set_cursor_position(2, console_layout.input_row);
-                for (int i = 0; i < console_layout.width - 2; i++) printf(" ");
-                set_cursor_position(2, console_layout.input_row);
-                LeaveCriticalSection(&console_lock);
-            }
-            else if (pos < MAX_MSG - 1 && ch >= 32 && ch <= 126) {
-                input[pos++] = ch;
-                EnterCriticalSection(&console_lock);
-                printf("%c", ch);
-                LeaveCriticalSection(&console_lock);
+                else if (pos < MAX_MSG - 1 && ch >= 32 && ch <= 126) {
+                    input[pos++] = ch;
+                    EnterCriticalSection(&console_lock);
+                    printf("%c", ch);
+                    LeaveCriticalSection(&console_lock);
+                }
+            } else {
+                Sleep(10);
             }
         }
         
+        if (!state->running) break;
         if (strlen(input) == 0) continue;
         
         EnterCriticalSection(&console_lock);
@@ -700,9 +877,14 @@ int get_server_info(char *host, int *port) {
 }
 
 int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    
     ClientState state = {0};
     state.current_channel = -1;
     state.connected_users = 0;
+    state.authenticated = 0;
+    state.server_requires_auth = 0;
     
     char host[MAX_IP];
     int port = 8888;
@@ -750,6 +932,8 @@ int main(int argc, char *argv[]) {
             
             state.current_channel = -1;
             state.connected_users = 0;
+            state.authenticated = 0;
+            state.server_requires_auth = 0;
         }
     }
     WSACleanup();
